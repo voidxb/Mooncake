@@ -17,10 +17,14 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include <cuda.h>
@@ -39,6 +43,43 @@ class MnnvlTransportTestPeer {
                            uint64_t length, SegmentID target_id) {
         return transport.relocateSharedMemoryAddress(address, length,
                                                      target_id);
+    }
+
+    // Seed cache-only tests without creating a CUDA context or importing a
+    // real mapping. The transport stays uninstalled, so teardown never tries
+    // to unmap these synthetic addresses.
+    static void seed(MnnvlTransport& transport,
+                     std::shared_ptr<ControlService> metadata,
+                     uint64_t remote_addr, size_t length,
+                     const std::string& handle, uint64_t mapped_addr) {
+        transport.metadata_ = std::move(metadata);
+        transport.handle_type_ = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+        MnnvlTransport::OpenedMnnvlEntry entry;
+        entry.mnnvl_addr = reinterpret_cast<void*>(mapped_addr);
+        entry.length = length;
+        entry.mnnvl_handle = handle;
+        transport.relocate_map_[LOCAL_SEGMENT_ID][remote_addr] =
+            std::move(entry);
+        transport.relocate_generation_.fetch_add(1);
+    }
+
+    static void start(MnnvlTransport& transport, MnnvlSubBatch& batch) {
+        std::vector<MnnvlTask*> tasks;
+        for (auto& task : batch.task_list) tasks.push_back(&task);
+        transport.startTransfer(tasks, &batch);
+    }
+
+    static Status importHandle(MnnvlTransport& transport,
+                               CUmemAllocationHandleType type,
+                               const std::string& handle) {
+        transport.handle_type_ = type;
+        BufferDesc buffer;
+        buffer.length = 2 << 20;
+        buffer.mnnvl_handle = handle;
+        MnnvlTransport::OpenedMnnvlEntry entry;
+        auto status = transport.importRemoteBuffer(buffer, entry);
+        if (status.ok()) transport.releaseImportedEntry(entry);
+        return status;
     }
 };
 
@@ -231,6 +272,68 @@ pid_t exitedChildPid() {
 
 }  // namespace
 
+TEST(MnnvlTransportTest, MalformedHandlesReturnErrorsWithoutThrowing) {
+    MnnvlTransport transport;
+    for (const std::string handle : {"not-a-pid-fd", "123-fd", "0-3",
+                                     "123-3junk", "99999999999999999999-3"}) {
+        SCOPED_TRACE(handle);
+        EXPECT_FALSE(
+            MnnvlTransportTestPeer::importHandle(
+                transport, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, handle)
+                .ok());
+    }
+    for (const std::string handle : {"f", "zz", "00"}) {
+        SCOPED_TRACE(handle);
+        EXPECT_FALSE(MnnvlTransportTestPeer::importHandle(
+                         transport, CU_MEM_HANDLE_TYPE_FABRIC, handle)
+                         .ok());
+    }
+}
+
+TEST(MnnvlTransportTest, RelocationCacheDetectsChangedPeerHandle) {
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(installLocalSegmentWithMnnvlHandle(
+                    *metadata, "cached-handle", kRemoteAddress, kBufferLength)
+                    .ok());
+    MnnvlTransport transport;
+    constexpr uint64_t mapped_addr = 0x20000000;
+    MnnvlTransportTestPeer::seed(transport, metadata, kRemoteAddress,
+                                 kBufferLength, "cached-handle", mapped_addr);
+    uint64_t address = kRemoteAddress + 64;
+    ASSERT_TRUE(MnnvlTransportTestPeer::relocate(transport, address, 64,
+                                                 LOCAL_SEGMENT_ID)
+                    .ok());
+    EXPECT_EQ(address, mapped_addr + 64);
+
+    ASSERT_TRUE(installLocalSegmentWithMnnvlHandle(
+                    *metadata, "not-a-pid-fd", kRemoteAddress, kBufferLength)
+                    .ok());
+    address = kRemoteAddress + 64;
+    EXPECT_FALSE(MnnvlTransportTestPeer::relocate(transport, address, 64,
+                                                  LOCAL_SEGMENT_ID)
+                     .ok());
+    EXPECT_EQ(address, kRemoteAddress + 64);
+}
+
+TEST(MnnvlTransportTest, RelocationCacheIsIsolatedBetweenInstances) {
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(installLocalSegmentWithMnnvlHandle(
+                    *metadata, "cached-handle", kRemoteAddress, kBufferLength)
+                    .ok());
+    MnnvlTransport first, second;
+    MnnvlTransportTestPeer::seed(first, metadata, kRemoteAddress, kBufferLength,
+                                 "cached-handle", 0x20000000);
+    MnnvlTransportTestPeer::seed(second, metadata, kRemoteAddress,
+                                 kBufferLength, "cached-handle", 0x30000000);
+    for (auto* transport : {&first, &second, &first}) {
+        uint64_t address = kRemoteAddress;
+        ASSERT_TRUE(MnnvlTransportTestPeer::relocate(*transport, address, 64,
+                                                     LOCAL_SEGMENT_ID)
+                        .ok());
+        EXPECT_EQ(address, transport == &first ? 0x20000000u : 0x30000000u);
+    }
+}
+
 // Regression guard: cuMemImportFromShareableHandle() takes the POSIX fd
 // value itself cast to void*, not a pointer to it. Passing &fd failed with
 // CUDA_ERROR_UNKNOWN, so the POSIX-FD handle type could never import a peer
@@ -276,6 +379,27 @@ TEST(MnnvlTransportTest, RelocateImportsPosixFdHandle) {
     for (uint32_t value : readback) {
         EXPECT_EQ(value, kPattern);
     }
+    // The same thread must not reuse a mapping after uninstall/reinstall.
+    const auto old_mapping = dest_addr;
+    ASSERT_TRUE(transport.uninstall().ok());
+    unsigned long long flags = 0;
+    CUmemLocation location{};
+    location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    location.id = 0;
+    EXPECT_NE(cuMemGetAccess(&flags, &location, (CUdeviceptr)old_mapping),
+              CUDA_SUCCESS);
+    ASSERT_TRUE(
+        transport
+            .install(local_segment_name, metadata, nullptr, makePosixFdConfig())
+            .ok());
+    dest_addr = kRemoteAddress + 64;
+    ASSERT_TRUE(MnnvlTransportTestPeer::relocate(
+                    transport, dest_addr, kBufferLength - 64, LOCAL_SEGMENT_ID)
+                    .ok());
+    ASSERT_EQ(cudaMemcpy(readback.data(), reinterpret_cast<void*>(dest_addr),
+                         kBufferLength - 64, cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    for (uint32_t value : readback) EXPECT_EQ(value, kPattern);
     ASSERT_TRUE(transport.uninstall().ok());
 }
 
@@ -313,6 +437,179 @@ TEST(MnnvlTransportTest, RelocateFailsCleanlyWhenPeerIsGone) {
                      transport, dest_addr, kBufferLength, LOCAL_SEGMENT_ID)
                      .ok());
     ASSERT_TRUE(transport.uninstall().ok());
+}
+
+// A malformed POSIX-FD handle published by a peer must fail the relocate
+// instead of escaping parsePidFd() as an exception.
+TEST(MnnvlTransportTest, RelocateRejectsMalformedPosixFdHandle) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+        GTEST_SKIP() << "No CUDA device available";
+    }
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    ASSERT_EQ(cudaFree(0), cudaSuccess);
+
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(installLocalSegmentWithMnnvlHandle(*metadata, "not-a-pid-fd",
+                                                   kRemoteAddress, 2 << 20)
+                    .ok());
+
+    MnnvlTransport transport;
+    std::string local_segment_name = "mnnvl_test_segment";
+    auto status = transport.install(local_segment_name, metadata, nullptr,
+                                    makePosixFdConfig());
+    if (!status.ok()) {
+        GTEST_SKIP() << "MnnvlTransport::install failed: " << status.ToString();
+    }
+
+    uint64_t dest_addr = kRemoteAddress;
+    EXPECT_FALSE(MnnvlTransportTestPeer::relocate(
+                     transport, dest_addr, kBufferLength, LOCAL_SEGMENT_ID)
+                     .ok());
+    EXPECT_EQ(dest_addr, kRemoteAddress);
+    ASSERT_TRUE(transport.uninstall().ok());
+}
+
+// transports/mnnvl/egm_strict without transports/mnnvl/egm must refuse host
+// allocations instead of silently handing out memory peers cannot address.
+TEST(MnnvlTransportTest, StrictEgmRejectsHostAllocationWithoutEgm) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+        GTEST_SKIP() << "No CUDA device available";
+    }
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    ASSERT_EQ(cudaFree(0), cudaSuccess);
+
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    auto conf = std::make_shared<Config>();
+    conf->set("transports/mnnvl/egm", false);
+    conf->set("transports/mnnvl/egm_strict", true);
+
+    MnnvlTransport transport;
+    std::string local_segment_name = "mnnvl_test_segment";
+    auto status =
+        transport.install(local_segment_name, metadata, nullptr, conf);
+    if (!status.ok()) {
+        GTEST_SKIP() << "MnnvlTransport::install failed: " << status.ToString();
+    }
+
+    MemoryOptions options;
+    options.location = "cpu:0";
+    void* addr = nullptr;
+    EXPECT_FALSE(transport.allocateLocalMemory(&addr, 2 << 20, options).ok());
+    EXPECT_EQ(addr, nullptr);
+    ASSERT_TRUE(transport.uninstall().ok());
+}
+
+TEST(MnnvlTransportTest, StrictRegistrationCleanupPreservesCallerPinning) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0)
+        GTEST_SKIP() << "No CUDA device available";
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    auto conf = std::make_shared<Config>();
+    conf->set("transports/mnnvl/egm", true);
+    conf->set("transports/mnnvl/egm_strict", true);
+    MnnvlTransport transport;
+    std::string segment_name = "mnnvl_test_segment";
+    auto status = transport.install(segment_name, metadata, nullptr, conf);
+    if (!status.ok()) GTEST_SKIP() << status.ToString();
+
+    std::vector<uint8_t> buffer(kBufferLength);
+    ASSERT_EQ(
+        cudaHostRegister(buffer.data(), buffer.size(), cudaHostRegisterDefault),
+        cudaSuccess);
+    BufferDesc desc;
+    desc.addr = reinterpret_cast<uint64_t>(buffer.data());
+    desc.length = buffer.size();
+    desc.location = "cpu:0";
+    MemoryOptions options;
+    options.type = MNNVL;
+    EXPECT_FALSE(transport.addMemoryBuffer(desc, options).ok());
+    EXPECT_TRUE(desc.mnnvl_handle.empty());
+    EXPECT_FALSE(transport.tracksLocalBuffer(desc));
+    EXPECT_TRUE(transport.removeMemoryBuffer(desc).ok());
+    // Caller ownership remains intact after defensive engine cleanup.
+    EXPECT_EQ(cudaHostUnregister(buffer.data()), cudaSuccess);
+    EXPECT_TRUE(transport.uninstall().ok());
+}
+
+TEST(MnnvlTransportTest, CopyWaitsForRequestProducerEvent) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0)
+        GTEST_SKIP() << "No CUDA device available";
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    CUDAStreamPool pool;
+    CUDAStreamHandle producer_stream;
+    ASSERT_TRUE(pool.acquire(producer_stream, 0).ok());
+    MnnvlSubBatch batch;
+    ASSERT_TRUE(pool.acquire(batch.async_stream, 0).ok());
+    batch.stream_device_id = 0;
+    void* source = nullptr;
+    void* target = nullptr;
+    ASSERT_EQ(cudaMalloc(&source, kBufferLength), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&target, kBufferLength), cudaSuccess);
+    ASSERT_EQ(cudaMemset(source, 0, kBufferLength), cudaSuccess);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    cudaEvent_t producer_event = nullptr;
+    ASSERT_EQ(cudaEventCreateWithFlags(&producer_event, cudaEventDisableTiming),
+              cudaSuccess);
+
+    struct Gate {
+        std::atomic<bool> released{false};
+        cudaStream_t stream;
+        ~Gate() {
+            released.store(true);
+            cudaStreamSynchronize(stream);
+        }
+    } gate{{false}, producer_stream.get()};
+    ASSERT_EQ(cudaLaunchHostFunc(
+                  producer_stream.get(),
+                  [](void* data) {
+                      auto& gate = *static_cast<Gate*>(data);
+                      // Bound the wait even if the test exits unexpectedly.
+                      auto deadline = std::chrono::steady_clock::now() +
+                                      std::chrono::seconds(5);
+                      while (!gate.released.load() &&
+                             std::chrono::steady_clock::now() < deadline)
+                          std::this_thread::yield();
+                  },
+                  &gate),
+              cudaSuccess);
+    ASSERT_EQ(
+        cudaMemsetAsync(source, 0x5a, kBufferLength, producer_stream.get()),
+        cudaSuccess);
+    ASSERT_EQ(cudaEventRecord(producer_event, producer_stream.get()),
+              cudaSuccess);
+
+    batch.task_list.emplace_back();
+    auto& task = batch.task_list.back();
+    task.request.opcode = Request::WRITE;
+    task.request.source = source;
+    task.request.length = kBufferLength;
+    task.request.producer_event = producer_event;
+    task.target_addr = reinterpret_cast<uint64_t>(target);
+    task.status_word = PENDING;
+    task.transferred_bytes = 0;
+    MnnvlTransport transport;
+    MnnvlTransportTestPeer::start(transport, batch);
+    TransferStatus before_release{};
+    EXPECT_TRUE(transport.getTransferStatus(&batch, 0, before_release).ok());
+    EXPECT_EQ(before_release.s, PENDING);
+    gate.released.store(true);
+    ASSERT_EQ(cudaStreamSynchronize(batch.async_stream.get()), cudaSuccess);
+    TransferStatus status{};
+    ASSERT_TRUE(transport.getTransferStatus(&batch, 0, status).ok());
+    EXPECT_EQ(status.s, COMPLETED);
+    EXPECT_EQ(status.transferred_bytes, kBufferLength);
+    std::vector<uint8_t> readback(kBufferLength);
+    ASSERT_EQ(cudaMemcpy(readback.data(), target, kBufferLength,
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    for (auto value : readback) EXPECT_EQ(value, 0x5a);
+    EXPECT_EQ(cudaEventDestroy(producer_event), cudaSuccess);
+    EXPECT_EQ(cudaFree(source), cudaSuccess);
+    EXPECT_EQ(cudaFree(target), cudaSuccess);
 }
 
 }  // namespace tent
