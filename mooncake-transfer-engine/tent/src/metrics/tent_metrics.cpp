@@ -239,6 +239,7 @@ void TentMetrics::registerMetrics() {
         &task_failures_total_,
         &deadline_infeasible_total_,
         &quarantined_batches_total_,
+        &mnnvl_events_total_,
     };
 
     gauges_ = {
@@ -349,6 +350,18 @@ void TentMetrics::recordInflightAttemptFinished(TransportType tp) {
     inflight_attempts_.incCached(
         transportSlot(tp),
         [tp] { return std::array<std::string, 1>{transportTypeName(tp)}; }, -1);
+}
+
+void TentMetrics::recordMnnvlEvent(MnnvlEvent event) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    static constexpr const char* names[] = {"fabric_fallback", "strict_failure",
+                                            "pool_hit", "pool_miss",
+                                            "completion_query"};
+    const size_t slot = static_cast<size_t>(event);
+    if (slot >= 5) return;
+    mnnvl_events_total_.incCached(
+        slot, [slot] { return std::array<std::string, 1>{names[slot]}; });
 }
 
 void TentMetrics::recordRegisteredBufferBytes(TransportType tp, int64_t delta) {
@@ -694,6 +707,10 @@ std::string TentMetrics::getJsonMetrics() {
             sumCounterValues(&read_failures_total_);
         root[write_failures_total_.str_name()] =
             sumCounterValues(&write_failures_total_);
+        for (auto& cell : mnnvl_events_total_.copy()) {
+            root["tent_mnnvl_" + cell->label[0] + "_total"] =
+                cell->value.load(std::memory_order_relaxed);
+        }
         root[failover_total_.str_name()] = sumCounterValues(&failover_total_);
         root[transport_attempts_total_.str_name()] =
             sumCounterValues(&transport_attempts_total_);
@@ -810,6 +827,7 @@ void TentMetrics::recordInflightAttemptStarted(TransportType) {}
 void TentMetrics::recordInflightAttemptFinished(TransportType) {}
 void TentMetrics::recordRegisteredBufferBytes(TransportType, int64_t) {}
 void TentMetrics::recordStageLatency(Stage, TransportType, double) {}
+void TentMetrics::recordMnnvlEvent(MnnvlEvent) {}
 
 std::string TentMetrics::getPrometheusMetrics() {
     return "# TENT metrics disabled at compile time\n";

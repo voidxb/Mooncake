@@ -366,6 +366,11 @@ class TransferEngineImpl {
             return Status::InvalidArgument(
                 "Runtime config snapshot must not be null" LOC_MARK);
         }
+        if (mnnvl_config_.gpu_wait && snapshot->config &&
+            snapshot->config->get("enable_runtime_queue", false)) {
+            return Status::InvalidArgument(
+                "MNNVL gpu_wait prohibits enabling deferred runtime dispatch");
+        }
         std::atomic_store_explicit(&runtime_config_snapshot_,
                                    std::move(snapshot),
                                    std::memory_order_release);
@@ -605,6 +610,7 @@ class TransferEngineImpl {
    private:
     std::shared_ptr<Config> conf_;
     HpTcpTransportConfig hp_tcp_transport_config_;
+    MnnvlConfig mnnvl_config_;
     std::shared_ptr<ControlService> metadata_;
     std::shared_ptr<Topology> topology_;
     std::unique_ptr<TransportSelector> transport_selector_;
