@@ -130,6 +130,14 @@ void *allocate_buffer_allocator_memory(size_t total_size,
                                                           -1);
     }
 #endif
+    // MNNVL client buffers are private host endpoints even in VRAM builds.
+    if (protocol == "mnnvl" || protocol == "nvlink_host") {
+        if (!alignment || (alignment & (alignment - 1)) ||
+            total_size > SIZE_MAX - (alignment - 1))
+            return nullptr;
+        return aligned_alloc(
+            alignment, ((total_size + alignment - 1) / alignment) * alignment);
+    }
 #ifdef USE_VRAM_SEGMENT
     auto ret = allocate_vram_memory(total_size, protocol);
     if (!ret) {
@@ -172,6 +180,10 @@ void free_memory(const std::string &protocol, void *ptr, bool use_spdk_dma) {
         return;
     }
 #endif
+    if (protocol == "mnnvl" || protocol == "nvlink_host") {
+        free(ptr);
+        return;
+    }
 #ifdef USE_VRAM_SEGMENT
 #ifdef USE_INTRA_NVLINK
     freeFabricMemory_intra(ptr);

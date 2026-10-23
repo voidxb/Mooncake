@@ -213,6 +213,75 @@ TEST_F(SegmentTest, MountSegmentSuccess) {
     ValidateMountedSegment(segment_manager, segment, client_id);
 }
 
+TEST_F(SegmentTest, ReadableFabricIdentitySurvivesDrainAndRestore) {
+    SegmentManager manager(BufferAllocatorType::OFFSET);
+    const auto client_id = generate_uuid();
+    Segment source;
+    source.id = generate_uuid();
+    source.name = "source";
+    source.base = 0x300000000ULL;
+    source.size = 16 * 1024 * 1024;
+    source.te_endpoint = "10.0.0.1:18060";
+    source.protocol = "mnnvl";
+    source.physical_placement =
+        PhysicalPlacement{"fabric-a", "rack1", "tray1", 3, 0};
+    auto target = source;
+    target.id = generate_uuid();
+    target.name = "target";
+    target.base += source.size;
+    {
+        auto access = manager.getSegmentAccess();
+        ASSERT_EQ(access.MountSegment(source, client_id, client_liveness_),
+                  ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(target, client_id, client_liveness_),
+                  ErrorCode::OK);
+        ASSERT_EQ(
+            access.SetSegmentStatusByName(source.name, SegmentStatus::DRAINING),
+            ErrorCode::OK);
+        EXPECT_TRUE(access.CanCopyWithinFabric(source.name, target.name));
+        EXPECT_FALSE(access.IsSegmentAllocatable(source.name));
+    }
+    auto check_snapshot = [&](SegmentManager& segments) {
+        auto access = segments.getAllocatorAccess();
+        auto snapshot = access.SnapshotAllocatorManager(source.name);
+        EXPECT_EQ(snapshot.getAllocators(source.name), nullptr);
+        EXPECT_EQ(snapshot.getNames(), (std::vector<std::string>{target.name}));
+        EXPECT_TRUE(snapshot.CanCopyWithinFabric(source.name, target.name));
+        auto ordinary = access.SnapshotAllocatorManager();
+        EXPECT_EQ(ordinary.GetSegmentMetadata(source.name), nullptr);
+    };
+    check_snapshot(manager);
+
+    // Restored draining sources also resolve through mounted records, not the
+    // saved allocator index (which deliberately omits the source).
+    auto serialized = SegmentSerializer(&manager).Serialize({});
+    ASSERT_TRUE(serialized);
+    SegmentManager restored(BufferAllocatorType::OFFSET);
+    ASSERT_TRUE(SegmentSerializer(&restored).Deserialize(*serialized));
+    check_snapshot(restored);
+
+    {
+        auto access = manager.getSegmentAccess();
+        ASSERT_EQ(access.PrepareGracefulUnmountSegment(source.id),
+                  ErrorCode::OK);
+        EXPECT_TRUE(access.CanCopyWithinFabric(source.name, target.name));
+    }
+    check_snapshot(manager);
+    {
+        auto access = manager.getSegmentAccess();
+        size_t capacity = 0;
+        ASSERT_EQ(access.PrepareUnmountSegment(source.id, capacity),
+                  ErrorCode::OK);
+        ASSERT_EQ(access.CommitUnmountSegment(source.id, client_id, capacity),
+                  ErrorCode::OK);
+        EXPECT_FALSE(access.CanCopyWithinFabric(source.name, target.name));
+    }
+    auto access = manager.getAllocatorAccess();
+    auto removed = access.SnapshotAllocatorManager(source.name);
+    EXPECT_EQ(removed.GetSegmentMetadata(source.name), nullptr);
+    EXPECT_FALSE(removed.CanCopyWithinFabric(source.name, target.name));
+}
+
 TEST_F(SegmentTest, MemoryUsageSnapshotTracksMountedAllocatorState) {
     SegmentManager segment_manager(BufferAllocatorType::OFFSET);
     constexpr size_t kSegmentSize = 16 * 1024 * 1024;

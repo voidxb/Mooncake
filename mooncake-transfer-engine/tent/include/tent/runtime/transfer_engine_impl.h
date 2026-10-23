@@ -277,6 +277,13 @@ class TransferEngineImpl {
 
     Status freeLocalMemory(void* addr);
 
+    bool isStrictMnnvlEgm() const;
+    Status getEgmNumaNodes(std::vector<int>& nodes, bool nearest);
+    Status getEgmGranularity(int node, size_t& granularity);
+    bool isMnnvlExported(void* addr, size_t size) const;
+    // Caller must prevent new submissions while draining/freeing memory.
+    Status quiesce();
+
     Status registerLocalMemory(void* addr, size_t size,
                                Permission permission = kGlobalReadWrite);
 
@@ -422,7 +429,7 @@ class TransferEngineImpl {
     std::vector<TransportType> getSupportedTransports(
         TransportType request_type);
 
-    void deregisterRemovedBuffer(BufferDesc& desc);
+    Status deregisterRemovedBuffer(BufferDesc& desc);
 
     Status resubmitTransferTask(Batch* batch, size_t task_id);
 
@@ -569,6 +576,11 @@ class TransferEngineImpl {
                                 std::chrono::steady_clock::time_point end_time);
 
    private:
+    // Failed strict deregistrations retain their transport identity for retry.
+    std::recursive_mutex strict_memory_mutex_;
+    std::unordered_map<uint64_t, BufferDesc> pending_mnnvl_unregister_;
+    std::unordered_set<uint64_t> pending_mnnvl_metadata_;
+
     struct AllocatedMemory {
         void* addr;
         size_t size;

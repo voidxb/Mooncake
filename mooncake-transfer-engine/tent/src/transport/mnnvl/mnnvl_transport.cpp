@@ -312,7 +312,31 @@ Status MnnvlTransport::install(std::string &local_segment_name,
                      << "without transports/mnnvl/egm; host allocations "
                      << "through MNNVL will fail";
     }
-    return setPeerAccess();
+    CHECK_STATUS(setPeerAccess());
+    if (conf_->get("transports/mnnvl/store_egm", false)) {
+        std::vector<int> nodes;
+        CHECK_STATUS(getEgmNumaNodes(nodes, false));
+        for (int node : nodes) {
+            size_t granularity = 0;
+            CHECK_STATUS(getEgmGranularity(node, granularity));
+            CUmemAllocationProp prop = {};
+            CHECK_STATUS(buildEgmAllocationProp(handle_type_, prop, node));
+            CUmemGenericAllocationHandle allocation;
+            CHECK_CU(cuMemCreate(&allocation, granularity, &prop, 0));
+            CUmemFabricHandle exported;
+            auto result = cuMemExportToShareableHandle(&exported, allocation,
+                                                       handle_type_, 0);
+            LocalAllocation probe{nullptr, granularity, allocation, false};
+            auto released = releaseLocalAllocation(probe);
+            if (!released.ok()) {
+                std::lock_guard<std::mutex> lock(allocate_mutex_);
+                failed_allocations_.push_back(probe);
+            }
+            CHECK_CU(result);
+            CHECK_STATUS(released);
+        }
+    }
+    return Status::OK();
 }
 
 Status MnnvlTransport::uninstall() {
@@ -349,6 +373,17 @@ Status MnnvlTransport::quiesce() {
     for (auto *batch : active_batches_) {
         auto status = drainMnnvlBatch(batch);
         if (first_error.ok() && !status.ok()) first_error = status;
+    }
+    std::lock_guard<std::mutex> allocation_lock(allocate_mutex_);
+    for (auto it = failed_allocations_.begin();
+         it != failed_allocations_.end();) {
+        auto status = releaseLocalAllocation(*it);
+        if (status.ok()) {
+            it = failed_allocations_.erase(it);
+        } else {
+            if (first_error.ok()) first_error = status;
+            ++it;
+        }
     }
     return first_error;
 }
@@ -686,7 +721,8 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
                    isEgmAllocation(handle, handle_type_);
         if (result == CUDA_SUCCESS && !egm) cuMemRelease(handle);
         if (!egm) {
-            if (egm_strict_ && options.type == MNNVL) {
+            if (egm_strict_ && options.type == MNNVL &&
+                options.perm != kLocalReadWrite) {
                 return Status::InvalidArgument(
                     "MnnvlTransport: strict EGM registration of a host "
                     "buffer that is not an exportable EGM allocation" LOC_MARK);
@@ -701,6 +737,11 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
             return Status::OK();
         }
     } else if (result != CUDA_SUCCESS) {
+        if (egm_strict_ && options.type == MNNVL &&
+            options.perm != kLocalReadWrite)
+            return Status::InvalidArgument(
+                "MNNVL remote registration requires exportable VMM "
+                "memory" LOC_MARK);
         LOG(INFO) << "Memory region " << (void *)desc.addr
                   << "  will not be registered for MNNVL transport.";
         return Status::OK();
@@ -772,6 +813,13 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
         desc.addr = (uint64_t)range_base;
         desc.length = range_size;
     } else {
+        if (egm_strict_ && options.type == MNNVL &&
+            options.perm != kLocalReadWrite) {
+            if (exported_fd >= 0) close(exported_fd);
+            desc.mnnvl_handle.clear();
+            return Status::InvalidArgument(
+                "MNNVL export has no covering VMM range" LOC_MARK);
+        }
         LOG(WARNING) << "MnnvlTransport: cuMemGetAddressRange for "
                      << (void *)requested_addr << " returned cuResult "
                      << result << ", base " << (void *)range_base << ", size "
@@ -806,9 +854,56 @@ bool MnnvlTransport::tracksLocalBuffer(const BufferDesc &desc) const {
     return registered_host_buffers_.count(desc.addr) != 0;
 }
 
+Status MnnvlTransport::getEgmNumaNodes(std::vector<int> &nodes, bool nearest) {
+    nodes.clear();
+    if (!strictFabricEgm())
+        return Status::InvalidArgument(
+            "Strict Fabric EGM is unavailable" LOC_MARK);
+    int count = 0;
+    CHECK_CUDA(cudaGetDeviceCount(&count));
+    int current = -1;
+    if (nearest) CHECK_CUDA(cudaGetDevice(&current));
+    for (int device = 0; device < count; ++device) {
+        if (nearest && device != current) continue;
+        int node = -1;
+        CHECK_CUDA(
+            cudaDeviceGetAttribute(&node, cudaDevAttrHostNumaId, device));
+        if (node < 0)
+            return Status::InvalidArgument(
+                "GPU has no EGM host NUMA attachment" LOC_MARK);
+        nodes.push_back(node);
+    }
+    std::sort(nodes.begin(), nodes.end());
+    nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
+    if (nodes.empty())
+        return Status::InvalidArgument("No EGM NUMA nodes" LOC_MARK);
+    return Status::OK();
+}
+
+Status MnnvlTransport::getEgmGranularity(int node, size_t &granularity) {
+    granularity = 0;
+    if (!strictFabricEgm() || node < 0)
+        return Status::InvalidArgument("Invalid EGM NUMA query" LOC_MARK);
+    CUmemAllocationProp prop = {};
+    CHECK_STATUS(buildEgmAllocationProp(handle_type_, prop, node));
+    CHECK_CU(cuMemGetAllocationGranularity(&granularity, &prop,
+                                           CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+    if (!granularity || (granularity & (granularity - 1)))
+        return Status::InvalidArgument("Invalid EGM granularity" LOC_MARK);
+    return Status::OK();
+}
+
 Status MnnvlTransport::allocateLocalMemory(void **addr, size_t size,
                                            MemoryOptions &options) {
+    if (!addr)
+        return Status::InvalidArgument("Null allocation output" LOC_MARK);
+    *addr = nullptr;
+    if (!size) return Status::InvalidArgument("Empty allocation" LOC_MARK);
     LocationParser location(options.location);
+    if (location.type() != "cuda" && location.type() != "cpu" &&
+        options.location != kWildcardLocation)
+        return Status::InvalidArgument(
+            "Unsupported MNNVL allocation location" LOC_MARK);
     bool is_host = location.type() != "cuda";
     if (is_host && !egm_enabled_) {
         if (egm_strict_)
@@ -848,29 +943,37 @@ Status MnnvlTransport::allocateLocalMemory(void **addr, size_t size,
         return Platform::getLoader().allocate(addr, size, options);
     }
 
+    LocalAllocation allocation{nullptr, size, handle, false};
+    auto rollback = [&]() {
+        auto status = releaseLocalAllocation(allocation);
+        if (!status.ok()) {
+            LOG(ERROR) << "Retaining failed MNNVL allocation cleanup: "
+                       << status.ToString();
+            std::lock_guard<std::mutex> lock(allocate_mutex_);
+            failed_allocations_.push_back(allocation);
+        }
+    };
     result = cuMemAddressReserve((CUdeviceptr *)&ptr, size, granularity, 0, 0);
     if (result != CUDA_SUCCESS) {
-        cuMemRelease(handle);
+        rollback();
         return Status::InternalError(
             std::string("cuMemAddressReserve: cuResult ") +
             std::to_string(result) + LOC_MARK);
     }
 
+    allocation.addr = ptr;
     result = cuMemMap((CUdeviceptr)ptr, size, 0, handle, 0);
     if (result != CUDA_SUCCESS) {
-        cuMemAddressFree((CUdeviceptr)ptr, size);
-        cuMemRelease(handle);
+        rollback();
         return Status::InternalError(std::string("cuMemMap: cuResult ") +
                                      std::to_string(result) + LOC_MARK);
     }
 
+    allocation.mapped = true;
     int device_count = 0;
     auto cuda_err = cudaGetDeviceCount(&device_count);
     if (cuda_err != cudaSuccess) {
-        // Teardown order: unmap, release, then free VA range.
-        cuMemUnmap((CUdeviceptr)ptr, size);
-        cuMemRelease(handle);
-        cuMemAddressFree((CUdeviceptr)ptr, size);
+        rollback();
         return Status::InternalError(std::string("cudaGetDeviceCount: ") +
                                      cudaGetErrorString(cuda_err) + LOC_MARK);
     }
@@ -892,10 +995,7 @@ Status MnnvlTransport::allocateLocalMemory(void **addr, size_t size,
     result = cuMemSetAccess((CUdeviceptr)ptr, size, accessDesc.data(),
                             accessDesc.size());
     if (result != CUDA_SUCCESS) {
-        // Teardown order: unmap, release, then free VA range.
-        cuMemUnmap((CUdeviceptr)ptr, size);
-        cuMemRelease(handle);
-        cuMemAddressFree((CUdeviceptr)ptr, size);
+        rollback();
         return Status::InternalError(std::string("cuMemSetAccess: cuResult ") +
                                      std::to_string(result) + LOC_MARK);
     }
@@ -906,12 +1006,32 @@ Status MnnvlTransport::allocateLocalMemory(void **addr, size_t size,
     result = cuMemRelease(handle);
     if (result != CUDA_SUCCESS) {
         LOG(WARNING) << "MnnvlTransport: cuMemRelease after mapping failed: "
-                     << result;
+                     << result
+                     << "; retaining creator reference for free retry";
+    } else {
+        allocation.handle = 0;
     }
 
     *addr = ptr;
     std::lock_guard<std::mutex> lock(allocate_mutex_);
-    allocate_set_[*addr] = size;
+    allocate_set_[*addr] = allocation;
+    return Status::OK();
+}
+
+Status MnnvlTransport::releaseLocalAllocation(LocalAllocation &allocation) {
+    if (allocation.mapped) {
+        CHECK_CU(cuMemUnmap((CUdeviceptr)allocation.addr, allocation.size));
+        allocation.mapped = false;
+    }
+    if (allocation.handle) {
+        CHECK_CU(cuMemRelease(allocation.handle));
+        allocation.handle = 0;
+    }
+    if (allocation.addr) {
+        CHECK_CU(
+            cuMemAddressFree((CUdeviceptr)allocation.addr, allocation.size));
+        allocation.addr = nullptr;
+    }
     return Status::OK();
 }
 
@@ -919,16 +1039,13 @@ Status MnnvlTransport::freeLocalMemory(void *addr, size_t size) {
     std::lock_guard<std::mutex> lock(allocate_mutex_);
     auto it = allocate_set_.find(addr);
     if (it == allocate_set_.end()) {
+        if (conf_ && conf_->get("transports/mnnvl/store_egm", false))
+            return Status::InvalidArgument(
+                "Not an engine-owned EGM allocation" LOC_MARK);
         return Platform::getLoader().free(addr, size);
     }
-    // Use the mapped extent recorded at allocation time: callers pass the
-    // size they requested, which may be smaller than the granularity-rounded
-    // mapping, and cuMemUnmap/cuMemAddressFree need the full range.
-    size_t mapped_size = it->second;
-    // The creator handle was already released after mapping. Unmapping drops
-    // the mapping's last allocation reference; no additional retain is needed.
-    CHECK_CU(cuMemUnmap((CUdeviceptr)addr, mapped_size));
-    CHECK_CU(cuMemAddressFree((CUdeviceptr)addr, mapped_size));
+    // Retry only unfinished stages using the recorded rounded extent.
+    CHECK_STATUS(releaseLocalAllocation(it->second));
     allocate_set_.erase(it);
     return Status::OK();
 }

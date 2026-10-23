@@ -37,6 +37,7 @@ _CPP_PUBLIC_NAMES = {
     "ObjectDataType",
     "SoftPinAction",
     "ReplicateConfig",
+    "PhysicalPlacement",
     "ReplicaStatus",
     "MemoryDescriptor",
     "DiskDescriptor",
@@ -238,6 +239,7 @@ for name in (
     "_tensor_metadata_size",
     "_deserialize_tensor",
     "_get_pyclient_from_wrapper",
+    "PhysicalPlacement",
 ):
     try:
         getattr(store, name)

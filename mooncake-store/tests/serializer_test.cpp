@@ -7,6 +7,34 @@
 
 namespace mooncake::test {
 
+// The pre-placement RPC layout, including the previous compatible addition.
+struct LegacyReplicateConfig {
+    size_t replica_num{1};
+    size_t nof_replica_num{0};
+    size_t dfs_replica_num{0};
+    SoftPinAction soft_pin_action{SoftPinAction::PRESERVE};
+    std::optional<uint64_t> soft_pin_ttl_ms{};
+    bool with_hard_pin{false};
+    std::vector<std::string> preferred_segments{};
+    std::string preferred_segment{};
+    std::vector<std::string> preferred_nof_segments{};
+    bool prefer_alloc_in_same_node{false};
+    ObjectDataType data_type{ObjectDataType::UNKNOWN};
+    std::string host_id{};
+    std::optional<std::vector<std::string>> group_ids{};
+    struct_pack::compatible<std::vector<std::string>, 1> session_ids;
+};
+
+struct LegacySegment {
+    UUID id{0, 0};
+    std::string name{};
+    uintptr_t base{0};
+    size_t size{0};
+    std::string te_endpoint{};
+    std::string protocol;
+    std::string host_id{};
+};
+
 // Example class implementing serialization following the usage documentation
 class ExampleClass {
    public:
@@ -215,6 +243,91 @@ TEST_F(SerializerTest, MountedSegmentDeserializesLegacyFormatWithoutHostId) {
     EXPECT_EQ(restored->segment.name, "legacy_segment");
     EXPECT_TRUE(restored->segment.host_id.empty());
     EXPECT_EQ(restored->status, SegmentStatus::OK);
+}
+
+TEST_F(SerializerTest, PlacementRpcCompatibleInBothDirections) {
+    LegacyReplicateConfig legacy;
+    legacy.host_id = "host1";
+    legacy.session_ids = std::vector<std::string>{"session1"};
+    auto decoded = struct_pack::deserialize<ReplicateConfig>(
+        struct_pack::serialize(legacy));
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded->host_id, "host1");
+    EXPECT_EQ(decoded->SessionId(), "session1");
+    EXPECT_FALSE(decoded->requester_placement);
+    EXPECT_FALSE(decoded->fabric_domain);
+
+    decoded->requester_self_id = "rack1.host1#g3";
+    decoded->fabric_domain = "fabric1";
+    decoded->requester_placement =
+        PhysicalPlacement{"fabric1", "rack1", "host1", 3, 2};
+    const auto bytes = struct_pack::serialize(*decoded);
+    auto restored = struct_pack::deserialize<ReplicateConfig>(bytes);
+    ASSERT_TRUE(restored);
+    ASSERT_TRUE(restored->requester_placement);
+    EXPECT_EQ(*restored->requester_placement, *decoded->requester_placement);
+    EXPECT_EQ(*restored->requester_self_id, "rack1.host1#g3");
+    auto old_reader = struct_pack::deserialize<LegacyReplicateConfig>(bytes);
+    ASSERT_TRUE(old_reader);
+    EXPECT_EQ(old_reader->host_id, "host1");
+    ASSERT_TRUE(old_reader->session_ids);
+    EXPECT_EQ(old_reader->session_ids->front(), "session1");
+
+    LegacySegment old_segment;
+    old_segment.name = "rack1.host1#g3/numa2";
+    old_segment.te_endpoint = "10.0.0.1:18060";
+    old_segment.protocol = "mnnvl";
+    auto segment =
+        struct_pack::deserialize<Segment>(struct_pack::serialize(old_segment));
+    ASSERT_TRUE(segment);
+    EXPECT_FALSE(segment->physical_placement);
+    segment->physical_placement = *decoded->requester_placement;
+    auto segment_bytes = struct_pack::serialize(*segment);
+    auto new_segment = struct_pack::deserialize<Segment>(segment_bytes);
+    ASSERT_TRUE(new_segment);
+    EXPECT_EQ(*new_segment, *segment);
+    auto old_segment_reader =
+        struct_pack::deserialize<LegacySegment>(segment_bytes);
+    ASSERT_TRUE(old_segment_reader);
+    EXPECT_EQ(old_segment_reader->te_endpoint, "10.0.0.1:18060");
+}
+
+TEST_F(SerializerTest, MountedSegmentPreservesFabricIdentityAndProtocol) {
+    MountedSegment original;
+    original.segment.id = generate_uuid();
+    original.segment.name = "rack1.host1#g3/numa2";
+    original.segment.base = 0x300000000;
+    original.segment.size = 64 * 1024 * 1024;
+    original.segment.te_endpoint = "10.0.0.1:18060";
+    original.segment.protocol = "mnnvl";
+    original.segment.host_id = "host1";
+    original.segment.physical_placement =
+        PhysicalPlacement{"fabric1", "rack1", "host1", 3, 2};
+    original.buf_allocator = std::make_shared<OffsetBufferAllocator>(
+        original.segment.name, original.segment.base, original.segment.size,
+        original.segment.te_endpoint);
+    original.status = SegmentStatus::OK;
+    msgpack::sbuffer buffer;
+    MsgpackPacker packer(&buffer);
+    ASSERT_TRUE(Serializer<MountedSegment>::serialize(original, packer));
+    auto handle = msgpack::unpack(buffer.data(), buffer.size());
+    auto restored = Serializer<MountedSegment>::deserialize(handle.get());
+    ASSERT_TRUE(restored);
+    EXPECT_EQ(restored->segment, original.segment);
+    ASSERT_TRUE(restored->buf_allocator);
+    EXPECT_EQ(restored->buf_allocator->getTransportEndpoint(),
+              original.segment.te_endpoint);
+}
+
+TEST_F(SerializerTest, MountedMnnvlSegmentRejectsMissingPhysicalIdentity) {
+    MountedSegment original;
+    original.segment.id = generate_uuid();
+    original.segment.protocol = "mnnvl";
+    msgpack::sbuffer buffer;
+    MsgpackPacker packer(&buffer);
+    ASSERT_TRUE(Serializer<MountedSegment>::serialize(original, packer));
+    auto handle = msgpack::unpack(buffer.data(), buffer.size());
+    EXPECT_FALSE(Serializer<MountedSegment>::deserialize(handle.get()));
 }
 
 }  // namespace mooncake::test

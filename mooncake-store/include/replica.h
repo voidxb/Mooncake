@@ -134,6 +134,12 @@ struct ReplicateConfig {
     // directions.
     struct_pack::compatible<std::vector<std::string>, 1> session_ids;
 
+    // Versioned RPC additions: physical identity is separate from host_id and
+    // from the returned replica's routable transport endpoint.
+    struct_pack::compatible<std::string, 2> requester_self_id;
+    struct_pack::compatible<std::string, 2> fabric_domain;
+    struct_pack::compatible<PhysicalPlacement, 2> requester_placement;
+
     bool ValidSessionIds(size_t key_count) const {
         return !session_ids ||
                (session_ids->size() == key_count &&
@@ -203,6 +209,12 @@ struct ReplicateConfig {
            << ", data_type: " << config.data_type;
         if (!config.host_id.empty()) {
             os << ", host_id: " << config.host_id;
+        }
+        if (config.requester_self_id) {
+            os << ", requester_self_id: " << *config.requester_self_id;
+        }
+        if (config.fabric_domain) {
+            os << ", fabric_domain: " << *config.fabric_domain;
         }
         if (config.group_ids.has_value()) {
             os << ", group_ids: [";

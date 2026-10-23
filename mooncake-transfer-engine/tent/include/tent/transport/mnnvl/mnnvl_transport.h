@@ -104,6 +104,13 @@ class MnnvlTransport : public Transport {
 
     virtual bool supportsProducerEvent() const { return true; }
 
+    bool strictFabricEgm() const {
+        return installed_ && egm_enabled_ && egm_strict_ &&
+               handle_type_ == CU_MEM_HANDLE_TYPE_FABRIC;
+    }
+    Status getEgmNumaNodes(std::vector<int> &nodes, bool nearest);
+    Status getEgmGranularity(int node, size_t &granularity);
+
     virtual Status allocateLocalMemory(void **addr, size_t size,
                                        MemoryOptions &options);
 
@@ -168,9 +175,16 @@ class MnnvlTransport : public Transport {
     std::unordered_map<std::string, int> exported_fds_;
 
     std::mutex allocate_mutex_;
-    // VMM allocations owned by this transport: base address -> mapped extent
-    // (rounded to the allocation granularity), needed to unmap on free.
-    std::unordered_map<void *, size_t> allocate_set_;
+    struct LocalAllocation {
+        void *addr = nullptr;
+        size_t size = 0;
+        CUmemGenericAllocationHandle handle = 0;
+        bool mapped = false;
+    };
+    // Retain every unfinished VMM cleanup stage, including early failures.
+    std::unordered_map<void *, LocalAllocation> allocate_set_;
+    std::vector<LocalAllocation> failed_allocations_;
+    static Status releaseLocalAllocation(LocalAllocation &allocation);
     uint64_t async_memcpy_threshold_;
     bool supported_;
     CUmemAllocationHandleType handle_type_;

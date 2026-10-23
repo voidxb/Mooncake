@@ -921,9 +921,24 @@ tl::expected<void, SerializationError> Serializer<MountedSegment>::serialize(
     // Use array structure for packing, more efficient
     // Format: [segment_id, segment_name, segment_base, segment_size,
     // te_endpoint, status, has_buffer_allocator, buffer_allocator_data,
-    // host_id]
+    // host_id, protocol, physical_placement]
 
-    packer.pack_array(9);
+    packer.pack_array(11);
+    auto pack_metadata = [&]() {
+        packer.pack(mounted_segment.segment.host_id);
+        packer.pack(mounted_segment.segment.protocol);
+        if (!mounted_segment.segment.physical_placement) {
+            packer.pack_nil();
+            return;
+        }
+        const auto &p = *mounted_segment.segment.physical_placement;
+        packer.pack_array(5);
+        packer.pack(p.fabric_domain);
+        packer.pack(p.rack);
+        packer.pack(p.tray);
+        packer.pack(p.physical_gpu);
+        packer.pack(p.numa_node);
+    };
 
     // Serialize Segment info
     packer.pack(UuidToString(mounted_segment.segment.id));
@@ -946,14 +961,14 @@ tl::expected<void, SerializationError> Serializer<MountedSegment>::serialize(
             if (!result) {
                 return tl::unexpected(result.error());
             }
-            packer.pack(mounted_segment.segment.host_id);
+            pack_metadata();
             return {};
         }
     }
 
     packer.pack(false);  // Mark no valid buffer allocator exists
     packer.pack_nil();
-    packer.pack(mounted_segment.segment.host_id);
+    pack_metadata();
     return {};
 }
 
@@ -1012,6 +1027,25 @@ Serializer<MountedSegment>::deserialize(const msgpack::object &obj) {
         }
         if (obj.via.array.size >= 9) {
             mounted_segment.segment.host_id = array[8].as<std::string>();
+        }
+        if (obj.via.array.size >= 11) {
+            mounted_segment.segment.protocol = array[9].as<std::string>();
+            if (array[10].type != msgpack::type::NIL) {
+                const auto &fields = array[10];
+                if (fields.type != msgpack::type::ARRAY ||
+                    fields.via.array.size != 5)
+                    throw std::invalid_argument("invalid physical placement");
+                const auto *f = fields.via.array.ptr;
+                PhysicalPlacement p{
+                    f[0].as<std::string>(), f[1].as<std::string>(),
+                    f[2].as<std::string>(), f[3].as<int>(), f[4].as<int>()};
+                if (!p.Valid())
+                    throw std::invalid_argument("invalid physical identity");
+                mounted_segment.segment.physical_placement = std::move(p);
+            }
+            if (mounted_segment.segment.protocol == "mnnvl" &&
+                !mounted_segment.segment.physical_placement)
+                throw std::invalid_argument("missing MNNVL physical identity");
         }
     } catch (const std::exception &e) {
         return tl::unexpected(SerializationError(
