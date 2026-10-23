@@ -780,11 +780,7 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
         desc.length = rounded_length;
     }
 
-    if (exported_fd >= 0) {
-        auto it = exported_fds_.find(desc.addr);
-        if (it != exported_fds_.end()) close(it->second);
-        exported_fds_[desc.addr] = exported_fd;
-    }
+    if (exported_fd >= 0) exported_fds_.emplace(desc.mnnvl_handle, exported_fd);
     desc.transports.push_back(TransportType::MNNVL);
     return Status::OK();
 }
@@ -796,7 +792,7 @@ Status MnnvlTransport::removeMemoryBuffer(BufferDesc &desc) {
         CHECK_CUDA(cudaHostUnregister((void *)desc.addr));
         registered_host_buffers_.erase(host_it);
     }
-    auto fd_it = exported_fds_.find(desc.addr);
+    auto fd_it = exported_fds_.find(desc.mnnvl_handle);
     if (fd_it != exported_fds_.end()) {
         close(fd_it->second);
         exported_fds_.erase(fd_it);

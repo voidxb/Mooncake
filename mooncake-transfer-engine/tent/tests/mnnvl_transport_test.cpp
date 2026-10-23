@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -61,6 +62,14 @@ class MnnvlTransportTestPeer {
         transport.relocate_map_[LOCAL_SEGMENT_ID][remote_addr] =
             std::move(entry);
         transport.relocate_generation_.fetch_add(1);
+    }
+
+    // Own ordinary pipe FDs without CUDA initialization. No batches, host
+    // registrations or mappings exist, so uninstall only closes these FDs.
+    static void seedExportedFd(MnnvlTransport& transport,
+                               const BufferDesc& desc, int fd) {
+        transport.installed_ = true;
+        transport.exported_fds_.emplace(desc.mnnvl_handle, fd);
     }
 
     static void start(MnnvlTransport& transport, MnnvlSubBatch& batch) {
@@ -271,6 +280,73 @@ pid_t exitedChildPid() {
 }
 
 }  // namespace
+
+TEST(MnnvlTransportTest, RemovingSameBaseRegistrationKeepsOtherExportOpen) {
+    for (int removed_index : {0, 1}) {
+        SCOPED_TRACE(removed_index);
+        int fds[2];
+        ASSERT_EQ(pipe(fds), 0);
+        MnnvlTransport transport;
+        BufferDesc descs[2];
+        for (int i = 0; i < 2; ++i) {
+            descs[i].addr = kRemoteAddress;
+            descs[i].length = kBufferLength;
+            descs[i].mnnvl_handle =
+                std::to_string(getpid()) + "-" + std::to_string(fds[i]);
+            MnnvlTransportTestPeer::seedExportedFd(transport, descs[i], fds[i]);
+        }
+        const int survivor_index = 1 - removed_index;
+        const auto removed_desc = descs[removed_index];
+        const auto survivor_handle = descs[survivor_index].mnnvl_handle;
+        EXPECT_TRUE(transport.removeMemoryBuffer(descs[removed_index]).ok());
+        EXPECT_TRUE(descs[removed_index].mnnvl_handle.empty());
+        EXPECT_EQ(fcntl(fds[removed_index], F_GETFD), -1);
+        EXPECT_EQ(errno, EBADF);
+        EXPECT_GE(fcntl(fds[survivor_index], F_GETFD), 0);
+        EXPECT_EQ(descs[survivor_index].mnnvl_handle, survivor_handle);
+
+        // Failed/foreign registration cleanup at the same base owns no FD.
+        auto unowned = descs[survivor_index];
+        unowned.mnnvl_handle.clear();
+        EXPECT_TRUE(transport.removeMemoryBuffer(unowned).ok());
+        unowned.mnnvl_handle = "unowned-handle";
+        EXPECT_TRUE(transport.removeMemoryBuffer(unowned).ok());
+        EXPECT_GE(fcntl(fds[survivor_index], F_GETFD), 0);
+
+        // A repeated removal must not close an unrelated reused FD number.
+        int reused_fd = dup(fds[survivor_index]);
+        ASSERT_GE(reused_fd, 0);
+        auto stale_desc = removed_desc;
+        EXPECT_TRUE(transport.removeMemoryBuffer(stale_desc).ok());
+        EXPECT_GE(fcntl(reused_fd, F_GETFD), 0);
+        EXPECT_EQ(close(reused_fd), 0);
+        EXPECT_TRUE(transport.removeMemoryBuffer(descs[removed_index]).ok());
+        EXPECT_GE(fcntl(fds[survivor_index], F_GETFD), 0);
+
+        EXPECT_TRUE(transport.removeMemoryBuffer(descs[survivor_index]).ok());
+        EXPECT_EQ(fcntl(fds[survivor_index], F_GETFD), -1);
+        EXPECT_EQ(errno, EBADF);
+    }
+}
+
+TEST(MnnvlTransportTest, UninstallClosesAllSameBaseExports) {
+    int fds[2];
+    ASSERT_EQ(pipe(fds), 0);
+    MnnvlTransport transport;
+    for (int fd : fds) {
+        BufferDesc desc;
+        desc.addr = kRemoteAddress;
+        desc.length = kBufferLength;
+        desc.mnnvl_handle = std::to_string(getpid()) + "-" + std::to_string(fd);
+        MnnvlTransportTestPeer::seedExportedFd(transport, desc, fd);
+    }
+    EXPECT_TRUE(transport.uninstall().ok());
+    for (int fd : fds) {
+        EXPECT_EQ(fcntl(fd, F_GETFD), -1);
+        EXPECT_EQ(errno, EBADF);
+    }
+    EXPECT_TRUE(transport.uninstall().ok());
+}
 
 TEST(MnnvlTransportTest, MalformedHandlesReturnErrorsWithoutThrowing) {
     MnnvlTransport transport;
@@ -610,6 +686,81 @@ TEST(MnnvlTransportTest, CopyWaitsForRequestProducerEvent) {
     EXPECT_EQ(cudaEventDestroy(producer_event), cudaSuccess);
     EXPECT_EQ(cudaFree(source), cudaSuccess);
     EXPECT_EQ(cudaFree(target), cudaSuccess);
+}
+
+// Exercise actual export bookkeeping after two subranges expand to one VMM
+// allocation. Unlike the pipe tests, this requires a CUDA-capable host.
+TEST(MnnvlTransportTest, SameVmmBaseRegistrationsKeepIndependentExports) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0)
+        GTEST_SKIP() << "No CUDA device available";
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    ASSERT_EQ(cudaFree(0), cudaSuccess);
+    CUdevice device;
+    ASSERT_EQ(cuDeviceGet(&device, 0), CUDA_SUCCESS);
+    int fd_supported = 0;
+    ASSERT_EQ(
+        cuDeviceGetAttribute(
+            &fd_supported,
+            CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED,
+            device),
+        CUDA_SUCCESS);
+    if (!fd_supported) GTEST_SKIP() << "No POSIX-FD VMM support";
+
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    MnnvlTransport transport;
+    std::string segment_name = "mnnvl_test_segment";
+    auto status =
+        transport.install(segment_name, metadata, nullptr, makePosixFdConfig());
+    if (!status.ok()) GTEST_SKIP() << status.ToString();
+
+    MemoryOptions options;
+    options.type = MNNVL;
+    options.location = "cuda:0";
+    void* ptr = nullptr;
+    ASSERT_TRUE(
+        transport.allocateLocalMemory(&ptr, kBufferLength, options).ok());
+    auto free_buffer = [&transport](void* addr) {
+        EXPECT_TRUE(transport.freeLocalMemory(addr, kBufferLength).ok());
+    };
+    std::unique_ptr<void, decltype(free_buffer)> allocation(ptr, free_buffer);
+    BufferDesc first;
+    first.addr = reinterpret_cast<uint64_t>(ptr);
+    first.length = kBufferLength / 2;
+    first.location = options.location;
+    BufferDesc second = first;
+    second.addr += kBufferLength / 2;
+    ASSERT_TRUE(transport.addMemoryBuffer(first, options).ok());
+    ASSERT_FALSE(first.mnnvl_handle.empty());
+    ASSERT_TRUE(transport.addMemoryBuffer(second, options).ok());
+    ASSERT_FALSE(second.mnnvl_handle.empty());
+    EXPECT_EQ(first.addr, second.addr);
+    EXPECT_EQ(first.length, second.length);
+    EXPECT_NE(first.mnnvl_handle, second.mnnvl_handle);
+    const int first_fd = std::stoi(
+        first.mnnvl_handle.substr(first.mnnvl_handle.find_last_of('-') + 1));
+    const int second_fd = std::stoi(
+        second.mnnvl_handle.substr(second.mnnvl_handle.find_last_of('-') + 1));
+    EXPECT_GE(fcntl(first_fd, F_GETFD), 0);
+    EXPECT_GE(fcntl(second_fd, F_GETFD), 0);
+
+    EXPECT_TRUE(transport.removeMemoryBuffer(first).ok());
+    EXPECT_EQ(fcntl(first_fd, F_GETFD), -1);
+    EXPECT_EQ(errno, EBADF);
+    EXPECT_GE(fcntl(second_fd, F_GETFD), 0);
+    // The surviving published FD must remain importable, not merely open.
+    CUmemGenericAllocationHandle imported;
+    ASSERT_EQ(cuMemImportFromShareableHandle(
+                  &imported,
+                  reinterpret_cast<void*>(static_cast<uintptr_t>(second_fd)),
+                  CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR),
+              CUDA_SUCCESS);
+    EXPECT_EQ(cuMemRelease(imported), CUDA_SUCCESS);
+    EXPECT_TRUE(transport.removeMemoryBuffer(second).ok());
+    EXPECT_EQ(fcntl(second_fd, F_GETFD), -1);
+    EXPECT_EQ(errno, EBADF);
+    allocation.reset();
+    EXPECT_TRUE(transport.uninstall().ok());
 }
 
 }  // namespace tent

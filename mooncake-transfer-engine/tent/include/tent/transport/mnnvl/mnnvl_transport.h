@@ -163,7 +163,9 @@ class MnnvlTransport : public Transport {
     mutable std::mutex registration_mutex_;
     // Only unregister/close resources successfully acquired by this instance.
     std::unordered_set<uint64_t> registered_host_buffers_;
-    std::unordered_map<uint64_t, int> exported_fds_;
+    // Each POSIX export has its own published pid-fd handle. Different
+    // registrations can expand to the same VMM base without sharing an FD.
+    std::unordered_map<std::string, int> exported_fds_;
 
     std::mutex allocate_mutex_;
     // VMM allocations owned by this transport: base address -> mapped extent
