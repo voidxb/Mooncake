@@ -90,6 +90,27 @@ class MnnvlTransportTestPeer {
         if (status.ok()) transport.releaseImportedEntry(entry);
         return status;
     }
+
+    static Status ensureContext() {
+        return MnnvlTransport::ensureCudaContext();
+    }
+
+    static Status setupPeerAccess(MnnvlTransport& transport) {
+        return transport.setPeerAccess();
+    }
+
+    // Synthetic allocation records exercise bounds checks without CUDA.
+    // The uninstalled transport never attempts to free these addresses.
+    static void seedAllocation(MnnvlTransport& transport, uint64_t base,
+                               size_t size, bool mapped = true) {
+        auto* addr = reinterpret_cast<void*>(base);
+        transport.allocate_set_[addr] = {addr, size, 0, mapped};
+    }
+
+    static Status allocationRange(MnnvlTransport& transport, uint64_t address,
+                                  size_t length, uint64_t& base, size_t& size) {
+        return transport.getLocalAllocationRange(address, length, base, size);
+    }
 };
 
 namespace {
@@ -280,6 +301,88 @@ pid_t exitedChildPid() {
 }
 
 }  // namespace
+
+TEST(MnnvlTransportTest, OwnedVmmRangeIncludesSubranges) {
+    MnnvlTransport transport;
+    constexpr size_t mapped_size = 48 << 20;
+    MnnvlTransportTestPeer::seedAllocation(transport, kRemoteAddress,
+                                           mapped_size);
+    for (uint64_t address : {kRemoteAddress, kRemoteAddress + 64,
+                             kRemoteAddress + mapped_size - 64}) {
+        uint64_t base = 0;
+        size_t size = 0;
+        ASSERT_TRUE(MnnvlTransportTestPeer::allocationRange(transport, address,
+                                                            64, base, size)
+                        .ok());
+        EXPECT_EQ(base, kRemoteAddress);
+        EXPECT_EQ(size, mapped_size);
+    }
+}
+
+TEST(MnnvlTransportTest, OwnedVmmRangeRejectsOverflowAndOverrun) {
+    MnnvlTransport transport;
+    MnnvlTransportTestPeer::seedAllocation(transport, kRemoteAddress,
+                                           kBufferLength);
+    uint64_t base = 0;
+    size_t size = 0;
+    EXPECT_FALSE(
+        MnnvlTransportTestPeer::allocationRange(
+            transport, kRemoteAddress + kBufferLength - 32, 64, base, size)
+            .ok());
+    EXPECT_EQ(base, 0u);
+    EXPECT_EQ(size, 0u);
+    EXPECT_FALSE(MnnvlTransportTestPeer::allocationRange(
+                     transport, UINT64_MAX - 31, 64, base, size)
+                     .ok());
+    EXPECT_FALSE(MnnvlTransportTestPeer::allocationRange(
+                     transport, kRemoteAddress, 0, base, size)
+                     .ok());
+    EXPECT_FALSE(
+        MnnvlTransportTestPeer::allocationRange(transport, 0, 64, base, size)
+            .ok());
+
+    // Reject before exporting or initializing CUDA, even in non-strict mode.
+    BufferDesc desc;
+    desc.addr = kRemoteAddress + kBufferLength - 32;
+    desc.length = 64;
+    desc.location = "cpu:0";
+    MemoryOptions options;
+    options.type = MNNVL;
+    EXPECT_FALSE(transport.addMemoryBuffer(desc, options).ok());
+    EXPECT_TRUE(desc.mnnvl_handle.empty());
+    EXPECT_TRUE(desc.transports.empty());
+}
+
+TEST(MnnvlTransportTest, OwnedVmmRangeIgnoresUnknownAndUnmappedBuffers) {
+    MnnvlTransport transport;
+    MnnvlTransportTestPeer::seedAllocation(transport, kRemoteAddress,
+                                           kBufferLength);
+    for (uint64_t address :
+         {kRemoteAddress - 64, kRemoteAddress + kBufferLength}) {
+        uint64_t base = 1;
+        size_t size = 1;
+        EXPECT_TRUE(MnnvlTransportTestPeer::allocationRange(transport, address,
+                                                            64, base, size)
+                        .ok());
+        EXPECT_EQ(base, 0u);
+        EXPECT_EQ(size, 0u);
+    }
+    MnnvlTransportTestPeer::seedAllocation(transport, kRemoteAddress,
+                                           kBufferLength, false);
+    uint64_t base = 1;
+    size_t size = 1;
+    EXPECT_TRUE(MnnvlTransportTestPeer::allocationRange(
+                    transport, kRemoteAddress, 64, base, size)
+                    .ok());
+    EXPECT_EQ(base, 0u);
+    EXPECT_EQ(size, 0u);
+    MnnvlTransportTestPeer::seedAllocation(transport, UINT64_MAX - 31, 64);
+    EXPECT_TRUE(MnnvlTransportTestPeer::allocationRange(
+                    transport, UINT64_MAX - 31, 16, base, size)
+                    .ok());
+    EXPECT_EQ(base, 0u);
+    EXPECT_EQ(size, 0u);
+}
 
 TEST(MnnvlTransportTest, RemovingSameBaseRegistrationKeepsOtherExportOpen) {
     for (int removed_index : {0, 1}) {
@@ -710,8 +813,9 @@ TEST(MnnvlTransportTest, SameVmmBaseRegistrationsKeepIndependentExports) {
     auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
     MnnvlTransport transport;
     std::string segment_name = "mnnvl_test_segment";
-    auto status =
-        transport.install(segment_name, metadata, nullptr, makePosixFdConfig());
+    auto conf = makePosixFdConfig();
+    conf->set("transports/mnnvl/egm_strict", true);
+    auto status = transport.install(segment_name, metadata, nullptr, conf);
     if (!status.ok()) GTEST_SKIP() << status.ToString();
 
     MemoryOptions options;
@@ -730,10 +834,29 @@ TEST(MnnvlTransportTest, SameVmmBaseRegistrationsKeepIndependentExports) {
     first.location = options.location;
     BufferDesc second = first;
     second.addr += kBufferLength / 2;
+    uint64_t mapped_base = 0;
+    size_t mapped_size = 0;
+    ASSERT_TRUE(
+        MnnvlTransportTestPeer::allocationRange(
+            transport, first.addr, first.length, mapped_base, mapped_size)
+            .ok());
+    ASSERT_EQ(mapped_base, reinterpret_cast<uint64_t>(ptr));
+    ASSERT_GE(mapped_size, kBufferLength);
     ASSERT_TRUE(transport.addMemoryBuffer(first, options).ok());
     ASSERT_FALSE(first.mnnvl_handle.empty());
-    ASSERT_TRUE(transport.addMemoryBuffer(second, options).ok());
+    std::thread registration_thread([&] {
+        CUcontext context = nullptr;
+        ASSERT_EQ(cuCtxGetCurrent(&context), CUDA_SUCCESS);
+        ASSERT_EQ(context, nullptr);
+        auto registered = transport.addMemoryBuffer(second, options);
+        ASSERT_TRUE(registered.ok()) << registered.ToString();
+        ASSERT_EQ(cuCtxGetCurrent(&context), CUDA_SUCCESS);
+        EXPECT_NE(context, nullptr);
+    });
+    registration_thread.join();
     ASSERT_FALSE(second.mnnvl_handle.empty());
+    EXPECT_EQ(first.addr, mapped_base);
+    EXPECT_EQ(first.length, mapped_size);
     EXPECT_EQ(first.addr, second.addr);
     EXPECT_EQ(first.length, second.length);
     EXPECT_NE(first.mnnvl_handle, second.mnnvl_handle);
@@ -761,6 +884,42 @@ TEST(MnnvlTransportTest, SameVmmBaseRegistrationsKeepIndependentExports) {
     EXPECT_EQ(errno, EBADF);
     allocation.reset();
     EXPECT_TRUE(transport.uninstall().ok());
+}
+
+TEST(MnnvlTransportTest, PeerAccessInitializesCudaContextOnFreshThread) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0)
+        GTEST_SKIP() << "No CUDA device available";
+    ASSERT_EQ(cuInit(0), CUDA_SUCCESS);
+    std::thread worker([] {
+        CUcontext context = nullptr;
+        ASSERT_EQ(cuCtxGetCurrent(&context), CUDA_SUCCESS);
+        ASSERT_EQ(context, nullptr);
+        MnnvlTransport transport;
+        auto status = MnnvlTransportTestPeer::setupPeerAccess(transport);
+        ASSERT_TRUE(status.ok()) << status.ToString();
+        ASSERT_EQ(cuCtxGetCurrent(&context), CUDA_SUCCESS);
+        EXPECT_NE(context, nullptr);
+    });
+    worker.join();
+}
+
+TEST(MnnvlTransportTest, PreservesCurrentCudaContext) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0)
+        GTEST_SKIP() << "No CUDA device available";
+    // Also exercise a nonzero selected device when more than one is visible.
+    ASSERT_EQ(cudaSetDevice(device_count - 1), cudaSuccess);
+    ASSERT_EQ(cudaFree(nullptr), cudaSuccess);
+    CUcontext before = nullptr;
+    ASSERT_EQ(cuCtxGetCurrent(&before), CUDA_SUCCESS);
+    ASSERT_NE(before, nullptr);
+    auto status = MnnvlTransportTestPeer::ensureContext();
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    CUcontext after = nullptr;
+    ASSERT_EQ(cuCtxGetCurrent(&after), CUDA_SUCCESS);
+    EXPECT_EQ(after, before);
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
 }
 
 }  // namespace tent

@@ -698,6 +698,55 @@ Status MnnvlTransport::getTransferStatus(SubBatchRef batch, int task_id,
     return Status::OK();
 }
 
+Status MnnvlTransport::ensureCudaContext() {
+    CUcontext context = nullptr;
+    auto result = cuCtxGetCurrent(&context);
+    if (result == CUDA_ERROR_NOT_INITIALIZED) {
+        CHECK_CU(cuInit(0));
+        result = cuCtxGetCurrent(&context);
+    }
+    CHECK_CU(result);
+    // Keep an application-supplied context rather than replacing it with
+    // device 0's primary context.
+    if (context) return Status::OK();
+
+    int device = 0;
+    CHECK_CUDA(cudaGetDevice(&device));
+    CHECK_CUDA(cudaSetDevice(device));
+    CHECK_CUDA(cudaFree(nullptr));
+    CHECK_CU(cuCtxGetCurrent(&context));
+    if (!context)
+        return Status::InternalError("No current MNNVL CUDA context" LOC_MARK);
+    return Status::OK();
+}
+
+Status MnnvlTransport::getLocalAllocationRange(uint64_t address, size_t length,
+                                               uint64_t &base, size_t &size) {
+    base = 0;
+    size = 0;
+    if (!address || !length || length > UINT64_MAX - address)
+        return Status::InvalidArgument("Invalid MNNVL buffer range" LOC_MARK);
+    std::lock_guard<std::mutex> lock(allocate_mutex_);
+    for (const auto &entry : allocate_set_) {
+        const auto &allocation = entry.second;
+        const auto allocation_base =
+            reinterpret_cast<uint64_t>(allocation.addr);
+        if (!allocation.mapped || !allocation_base || !allocation.size ||
+            allocation.size > UINT64_MAX - allocation_base ||
+            address < allocation_base ||
+            address - allocation_base >= allocation.size)
+            continue;
+        if (length > allocation.size - (address - allocation_base))
+            return Status::InvalidArgument(
+                "MNNVL buffer exceeds its owned VMM allocation" LOC_MARK);
+        base = allocation_base;
+        size = allocation.size;
+        return Status::OK();
+    }
+    // External allocations must still be checked through the CUDA query.
+    return Status::OK();
+}
+
 Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
                                        const MemoryOptions &options) {
     std::lock_guard<std::mutex> lock(registration_mutex_);
@@ -713,6 +762,11 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
 
     const uint64_t requested_addr = desc.addr;
     const size_t requested_length = desc.length;
+    uint64_t owned_base = 0;
+    size_t owned_size = 0;
+    CHECK_STATUS(getLocalAllocationRange(requested_addr, requested_length,
+                                         owned_base, owned_size));
+    CHECK_STATUS(ensureCudaContext());
 
     CUmemGenericAllocationHandle handle;
     auto result = cuMemRetainAllocationHandle(&handle, (void *)desc.addr);
@@ -800,10 +854,15 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
     // offset 0. Only trust a range that is non-null and covers the requested
     // buffer; otherwise publishing it would make peers relocate into the
     // wrong (or a null) base.
-    CUdeviceptr range_base = 0;
-    size_t range_size = 0;
-    result = cuMemGetAddressRange(&range_base, &range_size,
-                                  (CUdeviceptr)requested_addr);
+    // Engine-owned VMM mappings have authoritative base/rounded-size records.
+    // Use those even for subranges: peers import the handle at offset zero.
+    // A HOST_NUMA mapping need not yield a usable cuMemGetAddressRange result.
+    CUdeviceptr range_base = static_cast<CUdeviceptr>(owned_base);
+    size_t range_size = owned_size;
+    result = CUDA_SUCCESS;
+    if (!owned_base)
+        result = cuMemGetAddressRange(&range_base, &range_size,
+                                      (CUdeviceptr)requested_addr);
     const bool range_valid =
         result == CUDA_SUCCESS && range_base != 0 && range_size != 0 &&
         range_base <= requested_addr &&
@@ -818,7 +877,11 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
             if (exported_fd >= 0) close(exported_fd);
             desc.mnnvl_handle.clear();
             return Status::InvalidArgument(
-                "MNNVL export has no covering VMM range" LOC_MARK);
+                std::string(
+                    "MNNVL export has no covering VMM range: cuResult ") +
+                std::to_string(result) + ", base " +
+                std::to_string(range_base) + ", size " +
+                std::to_string(range_size) + LOC_MARK);
         }
         LOG(WARNING) << "MnnvlTransport: cuMemGetAddressRange for "
                      << (void *)requested_addr << " returned cuResult "
@@ -1310,6 +1373,8 @@ Status MnnvlTransport::setPeerAccess() {
     int cuda_dev = 0;
     CHECK_CUDA(cudaGetDevice(&cuda_dev));
     CHECK_CUDA(cudaGetDeviceCount(&device_count));
+    // A single visible GPU still needs a context for local driver queries.
+    CHECK_STATUS(ensureCudaContext());
     if (device_count < 2) return Status::OK();
     for (int i = 0; i < device_count; ++i) {
         cudaSetDevice(i);

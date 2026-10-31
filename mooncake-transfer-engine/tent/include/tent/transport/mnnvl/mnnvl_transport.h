@@ -124,6 +124,11 @@ class MnnvlTransport : public Transport {
     Status relocateSharedMemoryAddress(uint64_t &dest_addr, uint64_t length,
                                        uint64_t target_id);
 
+    static Status ensureCudaContext();
+
+    Status getLocalAllocationRange(uint64_t address, size_t length,
+                                   uint64_t &base, size_t &size);
+
     Status setPeerAccess();
 
    private:
