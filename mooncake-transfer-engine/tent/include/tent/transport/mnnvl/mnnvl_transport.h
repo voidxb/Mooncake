@@ -42,6 +42,7 @@ struct MnnvlTask {
     volatile size_t transferred_bytes;
     uint64_t target_addr = 0;
     cudaEvent_t completion_event = nullptr;
+    bool cancel_requested = false;
 };
 
 struct MnnvlSubBatch : public Transport::SubBatch {
@@ -93,6 +94,8 @@ class MnnvlTransport : public Transport {
     virtual Status getTransferStatus(SubBatchRef batch, int task_id,
                                      TransferStatus &status);
 
+    virtual Status cancelTransferTask(SubBatchRef batch, int task_id);
+
     virtual Status addMemoryBuffer(BufferDesc &desc,
                                    const MemoryOptions &options);
 
@@ -103,6 +106,8 @@ class MnnvlTransport : public Transport {
     virtual const char *getName() const { return "mnnvl"; }
 
     virtual bool supportsProducerEvent() const { return true; }
+
+    virtual bool supportsCancellation() const { return true; }
 
     bool strictFabricEgm() const {
         return installed_ && egm_enabled_ && egm_strict_ &&
@@ -153,7 +158,7 @@ class MnnvlTransport : public Transport {
     static void releaseImportedEntry(const OpenedMnnvlEntry &entry);
 
     using HashMap =
-        std::unordered_map<SegmentID,
+        std::unordered_map<std::string,
                            std::unordered_map<uint64_t, OpenedMnnvlEntry>>;
 
     RWSpinlock relocate_lock_;
