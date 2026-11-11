@@ -542,6 +542,15 @@ Status MnnvlTransport::submitTransferTasks(
 
 void MnnvlTransport::startTransfer(std::vector<MnnvlTask *> &tasks,
                                    MnnvlSubBatch *batch) {
+    tasks.erase(std::remove_if(tasks.begin(), tasks.end(),
+                               [](MnnvlTask *task) {
+                                   if (!task->cancel_requested) return false;
+                                   task->transferred_bytes = 0;
+                                   task->status_word =
+                                       TransferStatusEnum::CANCELED;
+                                   return true;
+                               }),
+                tasks.end());
     if (tasks.empty()) return;
     cudaStream_t stream = batch->async_stream.get();
 
@@ -690,7 +699,9 @@ Status MnnvlTransport::getTransferStatus(SubBatchRef batch, int task_id,
         auto err = cudaEventQuery(task.completion_event);
         if (err == cudaSuccess) {
             task.transferred_bytes = task.request.length;
-            task.status_word = TransferStatusEnum::COMPLETED;
+            task.status_word = task.cancel_requested
+                                   ? TransferStatusEnum::CANCELED
+                                   : TransferStatusEnum::COMPLETED;
         } else if (err != cudaErrorNotReady) {
             LOG(ERROR) << "MnnvlTransport: completion event query failed: "
                        << cudaGetErrorString(err);
@@ -707,6 +718,18 @@ Status MnnvlTransport::getTransferStatus(SubBatchRef batch, int task_id,
     // Read status AFTER the poll so a just-observed completion/failure is
     // reported on this call rather than one poll cycle late.
     status = TransferStatus{task.status_word, task.transferred_bytes};
+    return Status::OK();
+}
+
+Status MnnvlTransport::cancelTransferTask(SubBatchRef batch, int task_id) {
+    auto mnnvl_batch = dynamic_cast<MnnvlSubBatch *>(batch);
+    if (!mnnvl_batch)
+        return Status::InvalidArgument("Invalid MNNVL sub-batch" LOC_MARK);
+    if (task_id < 0 || task_id >= (int)mnnvl_batch->task_list.size())
+        return Status::InvalidArgument("Invalid task id" LOC_MARK);
+    auto &task = mnnvl_batch->task_list[task_id];
+    if (task.status_word == TransferStatusEnum::PENDING)
+        task.cancel_requested = true;
     return Status::OK();
 }
 
@@ -1332,7 +1355,7 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
         refresh_cache();
     }
 
-    auto segment_it = tl_cache.map.find(target_id);
+    auto segment_it = tl_cache.map.find(pin->name);
     if (segment_it != tl_cache.map.end()) {
         auto it = segment_it->second.find(buffer->addr);
         if (it != segment_it->second.end() &&
@@ -1346,7 +1369,7 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
 
     RWSpinlock::WriteGuard guard(relocate_lock_);
 
-    auto &segment_map = relocate_map_[target_id];
+    auto &segment_map = relocate_map_[pin->name];
     auto entry_it = segment_map.find(buffer->addr);
     const bool reusable =
         entry_it != segment_map.end() &&

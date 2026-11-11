@@ -59,8 +59,9 @@ class MnnvlTransportTestPeer {
         entry.mnnvl_addr = reinterpret_cast<void*>(mapped_addr);
         entry.length = length;
         entry.mnnvl_handle = handle;
-        transport.relocate_map_[LOCAL_SEGMENT_ID][remote_addr] =
-            std::move(entry);
+        transport.relocate_map_[transport.metadata_->segmentManager()
+                                    .getLocal()
+                                    ->name][remote_addr] = std::move(entry);
         transport.relocate_generation_.fetch_add(1);
     }
 
@@ -302,6 +303,52 @@ pid_t exitedChildPid() {
 
 }  // namespace
 
+TEST(MnnvlTransportTest, CancellationValidatesBatchAndTask) {
+    MnnvlTransport transport;
+    MnnvlSubBatch batch;
+    EXPECT_TRUE(transport.supportsCancellation());
+    EXPECT_TRUE(transport.cancelTransferTask(nullptr, 0).IsInvalidArgument());
+    EXPECT_TRUE(transport.cancelTransferTask(&batch, 0).IsInvalidArgument());
+    batch.task_list.emplace_back();
+    EXPECT_TRUE(transport.cancelTransferTask(&batch, -1).IsInvalidArgument());
+    EXPECT_TRUE(transport.cancelTransferTask(&batch, 1).IsInvalidArgument());
+}
+
+TEST(MnnvlTransportTest, CancellationPreservesTerminalResults) {
+    MnnvlTransport transport;
+    MnnvlSubBatch batch;
+    batch.task_list.emplace_back();
+    auto& task = batch.task_list.back();
+    for (auto terminal : {COMPLETED, FAILED, CANCELED}) {
+        task.status_word = terminal;
+        task.transferred_bytes = kBufferLength;
+        EXPECT_TRUE(transport.cancelTransferTask(&batch, 0).ok());
+        EXPECT_TRUE(transport.cancelTransferTask(&batch, 0).ok());
+        TransferStatus status{};
+        ASSERT_TRUE(transport.getTransferStatus(&batch, 0, status).ok());
+        EXPECT_EQ(status.s, terminal);
+        EXPECT_EQ(status.transferred_bytes, kBufferLength);
+    }
+}
+
+TEST(MnnvlTransportTest, CancellationPreventsUnsubmittedCopy) {
+    MnnvlTransport transport;
+    MnnvlSubBatch batch;
+    batch.task_list.emplace_back();
+    auto& task = batch.task_list.back();
+    task.status_word = PENDING;
+    task.transferred_bytes = 0;
+    ASSERT_TRUE(transport.cancelTransferTask(&batch, 0).ok());
+    ASSERT_TRUE(transport.cancelTransferTask(&batch, 0).ok());
+    EXPECT_EQ(task.status_word, PENDING);
+    MnnvlTransportTestPeer::start(transport, batch);
+    TransferStatus status{};
+    ASSERT_TRUE(transport.getTransferStatus(&batch, 0, status).ok());
+    EXPECT_EQ(status.s, CANCELED);
+    EXPECT_EQ(status.transferred_bytes, 0);
+    EXPECT_EQ(task.completion_event, nullptr);
+}
+
 TEST(MnnvlTransportTest, OwnedVmmRangeIncludesSubranges) {
     MnnvlTransport transport;
     constexpr size_t mapped_size = 48 << 20;
@@ -513,6 +560,34 @@ TEST(MnnvlTransportTest, RelocationCacheIsIsolatedBetweenInstances) {
     }
 }
 
+TEST(MnnvlTransportTest, RelocationCacheSurvivesSegmentReopen) {
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(installLocalSegmentWithMnnvlHandle(
+                    *metadata, "cached-handle", kRemoteAddress, kBufferLength)
+                    .ok());
+    uint16_t port = 0;
+    ASSERT_TRUE(metadata->start(port).ok());
+    MnnvlTransport transport;
+    constexpr uint64_t mapped_addr = 0x20000000;
+    MnnvlTransportTestPeer::seed(transport, metadata, kRemoteAddress,
+                                 kBufferLength, "cached-handle", mapped_addr);
+    auto& manager = metadata->segmentManager();
+    const std::string endpoint = "127.0.0.1:" + std::to_string(port);
+    SegmentID previous_id = LOCAL_SEGMENT_ID;
+    for (int iteration = 0; iteration < 256; ++iteration) {
+        SegmentID target_id;
+        ASSERT_TRUE(manager.openRemote(target_id, endpoint).ok());
+        ASSERT_NE(target_id, previous_id);
+        uint64_t address = kRemoteAddress + 64;
+        ASSERT_TRUE(
+            MnnvlTransportTestPeer::relocate(transport, address, 64, target_id)
+                .ok());
+        EXPECT_EQ(address, mapped_addr + 64);
+        ASSERT_TRUE(manager.closeRemote(target_id).ok());
+        previous_id = target_id;
+    }
+}
+
 // Regression guard: cuMemImportFromShareableHandle() takes the POSIX fd
 // value itself cast to void*, not a pointer to it. Passing &fd failed with
 // CUDA_ERROR_UNKNOWN, so the POSIX-FD handle type could never import a peer
@@ -713,7 +788,9 @@ TEST(MnnvlTransportTest, StrictRegistrationCleanupPreservesCallerPinning) {
     EXPECT_TRUE(transport.uninstall().ok());
 }
 
-TEST(MnnvlTransportTest, CopyWaitsForRequestProducerEvent) {
+class MnnvlProducerEventTest : public ::testing::TestWithParam<bool> {};
+
+TEST_P(MnnvlProducerEventTest, CopyWaitsForRequestProducerEvent) {
     int device_count = 0;
     if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0)
         GTEST_SKIP() << "No CUDA device available";
@@ -727,7 +804,7 @@ TEST(MnnvlTransportTest, CopyWaitsForRequestProducerEvent) {
     void* source = nullptr;
     void* target = nullptr;
     ASSERT_EQ(cudaMalloc(&source, kBufferLength), cudaSuccess);
-    ASSERT_EQ(cudaMalloc(&target, kBufferLength), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&target, 2 * kBufferLength), cudaSuccess);
     ASSERT_EQ(cudaMemset(source, 0, kBufferLength), cudaSuccess);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     cudaEvent_t producer_event = nullptr;
@@ -761,6 +838,7 @@ TEST(MnnvlTransportTest, CopyWaitsForRequestProducerEvent) {
     ASSERT_EQ(cudaEventRecord(producer_event, producer_stream.get()),
               cudaSuccess);
 
+    batch.task_list.reserve(2);
     batch.task_list.emplace_back();
     auto& task = batch.task_list.back();
     task.request.opcode = Request::WRITE;
@@ -770,8 +848,18 @@ TEST(MnnvlTransportTest, CopyWaitsForRequestProducerEvent) {
     task.target_addr = reinterpret_cast<uint64_t>(target);
     task.status_word = PENDING;
     task.transferred_bytes = 0;
+    batch.task_list.emplace_back();
+    auto& sibling = batch.task_list.back();
+    sibling.request = task.request;
+    sibling.target_addr = reinterpret_cast<uint64_t>(target) + kBufferLength;
+    sibling.status_word = PENDING;
+    sibling.transferred_bytes = 0;
     MnnvlTransport transport;
     MnnvlTransportTestPeer::start(transport, batch);
+    if (GetParam()) {
+        ASSERT_TRUE(transport.cancelTransferTask(&batch, 0).ok());
+        ASSERT_TRUE(transport.cancelTransferTask(&batch, 0).ok());
+    }
     TransferStatus before_release{};
     EXPECT_TRUE(transport.getTransferStatus(&batch, 0, before_release).ok());
     EXPECT_EQ(before_release.s, PENDING);
@@ -779,10 +867,14 @@ TEST(MnnvlTransportTest, CopyWaitsForRequestProducerEvent) {
     ASSERT_EQ(cudaStreamSynchronize(batch.async_stream.get()), cudaSuccess);
     TransferStatus status{};
     ASSERT_TRUE(transport.getTransferStatus(&batch, 0, status).ok());
-    EXPECT_EQ(status.s, COMPLETED);
+    EXPECT_EQ(status.s, GetParam() ? CANCELED : COMPLETED);
     EXPECT_EQ(status.transferred_bytes, kBufferLength);
-    std::vector<uint8_t> readback(kBufferLength);
-    ASSERT_EQ(cudaMemcpy(readback.data(), target, kBufferLength,
+    TransferStatus sibling_status{};
+    ASSERT_TRUE(transport.getTransferStatus(&batch, 1, sibling_status).ok());
+    EXPECT_EQ(sibling_status.s, COMPLETED);
+    EXPECT_EQ(sibling_status.transferred_bytes, kBufferLength);
+    std::vector<uint8_t> readback(2 * kBufferLength);
+    ASSERT_EQ(cudaMemcpy(readback.data(), target, readback.size(),
                          cudaMemcpyDeviceToHost),
               cudaSuccess);
     for (auto value : readback) EXPECT_EQ(value, 0x5a);
@@ -790,6 +882,9 @@ TEST(MnnvlTransportTest, CopyWaitsForRequestProducerEvent) {
     EXPECT_EQ(cudaFree(source), cudaSuccess);
     EXPECT_EQ(cudaFree(target), cudaSuccess);
 }
+
+INSTANTIATE_TEST_SUITE_P(Cancellation, MnnvlProducerEventTest,
+                         ::testing::Values(false, true));
 
 // Exercise actual export bookkeeping after two subranges expand to one VMM
 // allocation. Unlike the pipe tests, this requires a CUDA-capable host.
